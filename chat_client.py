@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import sys
@@ -15,10 +16,11 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 STUN_SERVER = "stun:stun.l.google.com:19302"
+PASTE_PREFIX = "P2PCHAT1:"
 
 
 class ChatClient:
-    def __init__(self, room: str, signaling_url: str) -> None:
+    def __init__(self, room: str | None = None, signaling_url: str | None = None) -> None:
         self.room = room
         self.signaling_url = signaling_url
         self.pc: RTCPeerConnection | None = None
@@ -32,7 +34,54 @@ class ChatClient:
     def _rtc_config(self) -> RTCConfiguration:
         return RTCConfiguration(iceServers=[RTCIceServer(urls=[STUN_SERVER])])
 
+    @staticmethod
+    def encode_session(desc: RTCSessionDescription) -> str:
+        payload = json.dumps({"type": desc.type, "sdp": desc.sdp}, separators=(",", ":"))
+        encoded = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+        return PASTE_PREFIX + encoded
+
+    @staticmethod
+    def decode_session(blob: str) -> RTCSessionDescription:
+        blob = blob.strip()
+        if blob.startswith(PASTE_PREFIX):
+            blob = blob[len(PASTE_PREFIX) :]
+            padding = "=" * (-len(blob) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(blob + padding))
+        elif blob.startswith("{"):
+            payload = json.loads(blob)
+        else:
+            raise ValueError("Неизвестный формат. Ожидается строка P2PCHAT1:... или JSON.")
+
+        if "type" not in payload or "sdp" not in payload:
+            raise ValueError("В строке нет type/sdp.")
+
+        return RTCSessionDescription(sdp=payload["sdp"], type=payload["type"])
+
+    async def _read_paste(self, prompt: str) -> str:
+        print(prompt)
+        print("(вставьте строку целиком и нажмите Enter)")
+        loop = asyncio.get_running_loop()
+        line = await loop.run_in_executor(None, input)
+        return line.strip()
+
+    async def _wait_for_ice_gathering(self) -> None:
+        assert self.pc is not None
+        if self.pc.iceGatheringState == "complete":
+            return
+
+        done = asyncio.Event()
+
+        @self.pc.on("icegatheringstatechange")
+        async def on_gathering_state_change() -> None:
+            if self.pc and self.pc.iceGatheringState == "complete":
+                done.set()
+
+        if self.pc.iceGatheringState == "complete":
+            return
+        await done.wait()
+
     async def connect_signaling(self) -> None:
+        assert self.signaling_url and self.room
         self.ws = await websockets.connect(self.signaling_url)
         await self.ws.send(json.dumps({"type": "join", "room": self.room}))
 
@@ -123,26 +172,28 @@ class ChatClient:
             print(f"\n[peer] {message}")
             print("> ", end="", flush=True)
 
-    async def _init_peer_connection(self) -> None:
+    async def _init_peer_connection(self, *, trickle: bool) -> None:
         self.pc = RTCPeerConnection(configuration=self._rtc_config())
 
         @self.pc.on("datachannel")
         def on_datachannel(channel):
             self._setup_channel(channel)
 
-        @self.pc.on("icecandidate")
-        async def on_icecandidate(candidate):
-            if candidate:
-                await self._send_signal(
-                    {
-                        "type": "candidate",
-                        "candidate": "candidate:" + candidate_to_sdp(candidate),
-                        "sdpMid": candidate.sdpMid,
-                        "sdpMLineIndex": candidate.sdpMLineIndex,
-                    }
-                )
-            else:
-                await self._send_signal({"type": "candidate", "candidate": None})
+        if trickle:
+
+            @self.pc.on("icecandidate")
+            async def on_icecandidate(candidate):
+                if candidate:
+                    await self._send_signal(
+                        {
+                            "type": "candidate",
+                            "candidate": "candidate:" + candidate_to_sdp(candidate),
+                            "sdpMid": candidate.sdpMid,
+                            "sdpMLineIndex": candidate.sdpMLineIndex,
+                        }
+                    )
+                else:
+                    await self._send_signal({"type": "candidate", "candidate": None})
 
     async def _start_offer(self) -> None:
         assert self.pc is not None
@@ -157,9 +208,56 @@ class ChatClient:
             {"type": self.pc.localDescription.type, "sdp": self.pc.localDescription.sdp}
         )
 
+    async def run_manual(self, role: str) -> None:
+        await self._init_peer_connection(trickle=False)
+        assert self.pc is not None
+
+        if role == "host":
+            print("[manual] Вы — инициатор (host).")
+            channel = self.pc.createDataChannel("chat")
+            self._setup_channel(channel)
+
+            offer = await self.pc.createOffer()
+            await self.pc.setLocalDescription(offer)
+            await self._wait_for_ice_gathering()
+
+            offer_blob = self.encode_session(self.pc.localDescription)
+            print("\n--- Отправьте эту строку второму участнику (Telegram, email и т.д.) ---")
+            print(offer_blob)
+            print("--- Конец строки ---\n")
+
+            answer_blob = await self._read_paste("Вставьте строку от второго участника:")
+            await self.pc.setRemoteDescription(self.decode_session(answer_blob))
+        else:
+            print("[manual] Вы — второй участник (guest).")
+            offer_blob = await self._read_paste("Вставьте строку от первого участника:")
+            await self.pc.setRemoteDescription(self.decode_session(offer_blob))
+
+            answer = await self.pc.createAnswer()
+            await self.pc.setLocalDescription(answer)
+            await self._wait_for_ice_gathering()
+
+            answer_blob = self.encode_session(self.pc.localDescription)
+            print("\n--- Отправьте эту строку первому участнику ---")
+            print(answer_blob)
+            print("--- Конец строки ---\n")
+
+        try:
+            await asyncio.wait_for(self.channel_ready.wait(), timeout=30)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "P2P-соединение не установилось за 30 с. "
+                "Возможен жёсткий NAT — нужен TURN или сервер сигнализации."
+            ) from exc
+
+        await self.chat_loop()
+
+        if self.pc:
+            await self.pc.close()
+
     async def chat_loop(self) -> None:
         await self.channel_ready.wait()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         while True:
             try:
@@ -178,9 +276,9 @@ class ChatClient:
             else:
                 print("[system] Channel not ready")
 
-    async def run(self) -> None:
+    async def run_server(self) -> None:
         await self.connect_signaling()
-        await self._init_peer_connection()
+        await self._init_peer_connection(trickle=True)
 
         signaling_task = asyncio.create_task(self.listen_signaling())
 
@@ -198,18 +296,46 @@ class ChatClient:
 
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="P2P chat client")
-    parser.add_argument("--room", required=True, help="Room name to join")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(
+        description="P2P chat client",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Примеры:\n"
+            "  python chat_client.py --room test --signaling ws://host:8765\n"
+            "  python chat_client.py --manual --role host\n"
+            "  python chat_client.py --manual --role guest\n"
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "--signaling",
-        required=True,
+        metavar="URL",
         help="Signaling server URL (e.g. ws://localhost:8765)",
+    )
+    mode.add_argument(
+        "--manual",
+        action="store_true",
+        help="Ручной обмен строками (без сервера, через мессенджер)",
+    )
+    parser.add_argument("--room", help="Room name (только с --signaling)")
+    parser.add_argument(
+        "--role",
+        choices=["host", "guest"],
+        help="host = инициатор, guest = второй участник (только с --manual)",
     )
     args = parser.parse_args()
 
+    if args.signaling and not args.room:
+        parser.error("--room обязателен при использовании --signaling")
+    if args.manual and not args.role:
+        parser.error("--role обязателен при использовании --manual")
+
     try:
-        client = ChatClient(args.room, args.signaling)
-        await client.run()
+        client = ChatClient(room=args.room, signaling_url=args.signaling)
+        if args.manual:
+            await client.run_manual(args.role)
+        else:
+            await client.run_server()
     except KeyboardInterrupt:
         print("\n[system] Goodbye")
     except ImportError as e:
