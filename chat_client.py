@@ -242,11 +242,12 @@ class ChatClient:
             print(answer_blob)
             print("--- Конец строки ---\n")
 
+        connect_timeout = 60 if role == "guest" else 30
         try:
-            await asyncio.wait_for(self.channel_ready.wait(), timeout=30)
+            await asyncio.wait_for(self.channel_ready.wait(), timeout=connect_timeout)
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
-                "P2P-соединение не установилось за 30 с. "
+                f"P2P-соединение не установилось за {connect_timeout} с. "
                 "Возможен жёсткий NAT — нужен TURN или сервер сигнализации."
             ) from exc
 
