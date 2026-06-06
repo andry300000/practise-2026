@@ -160,10 +160,14 @@ class ChatClient:
     def _setup_channel(self, channel) -> None:
         self.channel = channel
 
+        def mark_ready() -> None:
+            if not self.channel_ready.is_set():
+                print("[system] P2P connection established. Type messages ( /quit to exit )")
+                self.channel_ready.set()
+
         @channel.on("open")
         def on_open():
-            print("[system] P2P connection established. Type messages ( /quit to exit )")
-            self.channel_ready.set()
+            mark_ready()
 
         @channel.on("message")
         def on_message(message):
@@ -171,6 +175,9 @@ class ChatClient:
                 message = message.decode("utf-8", errors="replace")
             print(f"\n[peer] {message}")
             print("> ", end="", flush=True)
+
+        if channel.readyState == "open":
+            mark_ready()
 
     async def _init_peer_connection(self, *, trickle: bool) -> None:
         self.pc = RTCPeerConnection(configuration=self._rtc_config())
@@ -257,7 +264,8 @@ class ChatClient:
             await self.pc.close()
 
     async def chat_loop(self) -> None:
-        await self.channel_ready.wait()
+        if not self.channel_ready.is_set():
+            await self.channel_ready.wait()
         loop = asyncio.get_running_loop()
 
         while True:
